@@ -1,286 +1,600 @@
+/* Udacity Homework 3
+   HDR Tone-mapping
+
+  Background HDR
+  ==============
+
+  A High Dynamic Range (HDR) image contains a wider variation of intensity
+  and color than is allowed by the RGB format with 1 byte per channel that we
+  have used in the previous assignment.  
+
+  To store this extra information we use single precision floating point for
+  each channel.  This allows for an extremely wide range of intensity values.
+
+  In the image for this assignment, the inside of church with light coming in
+  through stained glass windows, the raw input floating point values for the
+  channels range from 0 to 275.  But the mean is .41 and 98% of the values are
+  less than 3!  This means that certain areas (the windows) are extremely bright
+  compared to everywhere else.  If we linearly map this [0-275] range into the
+  [0-255] range that we have been using then most values will be mapped to zero!
+  The only thing we will be able to see are the very brightest areas - the
+  windows - everything else will appear pitch black.
+
+  The problem is that although we have cameras capable of recording the wide
+  range of intensity that exists in the real world our monitors are not capable
+  of displaying them.  Our eyes are also quite capable of observing a much wider
+  range of intensities than our image formats / monitors are capable of
+  displaying.
+
+  Tone-mapping is a process that transforms the intensities in the image so that
+  the brightest values aren't nearly so far away from the mean.  That way when
+  we transform the values into [0-255] we can actually see the entire image.
+  There are many ways to perform this process and it is as much an art as a
+  science - there is no single "right" answer.  In this homework we will
+  implement one possible technique.
+
+  Background Chrominance-Luminance
+  ================================
+
+  The RGB space that we have been using to represent images can be thought of as
+  one possible set of axes spanning a three dimensional space of color.  We
+  sometimes choose other axes to represent this space because they make certain
+  operations more convenient.
+
+  Another possible way of representing a color image is to separate the color
+  information (chromaticity) from the brightness information.  There are
+  multiple different methods for doing this - a common one during the analog
+  television days was known as Chrominance-Luminance or YUV.
+
+  We choose to represent the image in this way so that we can remap only the
+  intensity channel and then recombine the new intensity values with the color
+  information to form the final image.
+
+  Old TV signals used to be transmitted in this way so that black & white
+  televisions could display the luminance channel while color televisions would
+  display all three of the channels.
+  
+
+  Tone-mapping
+  ============
+
+  In this assignment we are going to transform the luminance channel (actually
+  the log of the luminance, but this is unimportant for the parts of the
+  algorithm that you will be implementing) by compressing its range to [0, 1].
+  To do this we need the cumulative distribution of the luminance values.
+
+  Example
+  -------
+
+  input : [2 4 3 3 1 7 4 5 7 0 9 4 3 2]
+  min / max / range: 0 / 9 / 9
+
+  histo with 3 bins: [4 7 3]
+
+  cdf : [4 11 14]
+
+
+  Your task is to calculate this cumulative distribution by following these
+  steps.
+
+*/
+
 #include "utils.h"
-#include <string>
-#include "loadSaveImage.h"
-#include <thrust/extrema.h>
+#include "stdio.h"
+#include "cstdio"
+#include "math.h"
+#include "stdbool.h"
 
-//chroma-LogLuminance Space
-static float *d_x__;
-static float *d_y__;
-static float *d_logY__;
+#include "thrust/device_vector.h"
+#include "thrust/extrema.h"
+#include "thrust/host_vector.h"
+#include "thrust/device_ptr.h"
+#include "thrust/fill.h"
+#include "thrust/sort.h"
+#include "thrust/scan.h"
+#include "thrust/reduce.h"
+#include "thrust/sequence.h"
+#include "thrust/set_operations.h"
+#include <thrust/merge.h>
+#include "thrust/functional.h"
+#include <thrust/pair.h>
+#include <thrust/tuple.h>
 
-//memory for the cdf
-static unsigned int *d_cdf__;
 
-static const int numBins = 1024;
 
-size_t numRows__;
-size_t numCols__;
+// Wrapper code for time function
+#define time(X,Y) \
+	do { \
+		timer.Start(); \
+		X; \
+		if (Y) display_maxmin(&min_logLum, &max_logLum); \
+		timer.Stop(); \
+		printf("Your code executed in %g ms\n\n", timer.Elapsed()); \
+	} while (0);
 
-/* Copied from Mike's IPython notebook with some minor modifications
- * Mainly double precision constants to floats and log10 -> log10f
- * Also removed Luminance (Y) channel since it is never used       eke*/
-
-__global__ void rgb_to_xyY(
-    float* d_r,
-    float* d_g,
-    float* d_b,
-    float* d_x,
-    float* d_y,
-    float* d_log_Y,
-    float  delta,
-    int    num_pixels_y,
-    int    num_pixels_x )
+	
+struct GpuTimer
 {
-  int  ny             = num_pixels_y;
-  int  nx             = num_pixels_x;
-  int2 image_index_2d = make_int2( ( blockIdx.x * blockDim.x ) + threadIdx.x, ( blockIdx.y * blockDim.y ) + threadIdx.y );
-  int  image_index_1d = ( nx * image_index_2d.y ) + image_index_2d.x;
+      cudaEvent_t start;
+      cudaEvent_t stop;
+ 
+      GpuTimer()
+      {
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+      }
+ 
+      ~GpuTimer()
+      {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+      }
+ 
+      void Start()
+      {
+            cudaEventRecord(start, 0);
+      }
+ 
+      void Stop()
+      {
+            cudaEventRecord(stop, 0);
+      }
+ 
+      float Elapsed()
+      {
+            float elapsed;
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(&elapsed, start, stop);
+            return elapsed;
+      }
+};
 
-  if ( image_index_2d.x < nx && image_index_2d.y < ny )
-  {
-    float r = d_r[ image_index_1d ];
-    float g = d_g[ image_index_1d ];
-    float b = d_b[ image_index_1d ];
+// implemantion of thrust libraries max/min
+void thrust_maxmin(	const float* const  d_logLuminance,
+					const int array_size,
+					float* min_logLum,
+					float* max_logLum){
+						
+	printf("Thrust library implementation\n");
+	thrust::device_ptr<const float> dev_ptr = thrust::device_pointer_cast(d_logLuminance);
+	thrust::device_ptr<const float> min_ptr = thrust::min_element(dev_ptr, dev_ptr + array_size);
+    thrust::device_ptr<const float> max_ptr = thrust::max_element(dev_ptr, dev_ptr + array_size);
 
-    float X = ( r * 0.4124f ) + ( g * 0.3576f ) + ( b * 0.1805f );
-    float Y = ( r * 0.2126f ) + ( g * 0.7152f ) + ( b * 0.0722f );
-    float Z = ( r * 0.0193f ) + ( g * 0.1192f ) + ( b * 0.9505f );
-
-    float L = X + Y + Z;
-    float x = X / L;
-    float y = Y / L;
-
-    float log_Y = log10f( delta + Y );
-
-    d_x[ image_index_1d ]     = x;
-    d_y[ image_index_1d ]     = y;
-    d_log_Y[ image_index_1d ] = log_Y;
-  }
+	*min_logLum = min_ptr[0];
+	*max_logLum = max_ptr[0];
 }
 
-/* Copied from Mike's IPython notebook *
-   Modified just by having threads read the 
-   normalization constant directly from device memory
-   instead of copying it back                          */
+// naive serial implemantion of max/min
+void serial_maxmin(	const float* const  d_logLuminance,
+					const int array_size,
+					float* min_logLum,
+					float* max_logLum){
+	printf("Serial implementation\n");
+	const int array_bytes = array_size * sizeof(float);
+	float *  h_logLuminance = (float *) malloc(array_bytes);
+	cudaMemcpy( h_logLuminance , d_logLuminance, array_bytes, cudaMemcpyDeviceToHost);
+	
+	*min_logLum = 10;
+	*max_logLum = -10;
+	for (int i = 0; i < array_size; i++){
+		if (h_logLuminance[i] < *min_logLum){
+			*min_logLum = h_logLuminance[i];
+		}
+		if (h_logLuminance[i] > *max_logLum){
+			*max_logLum = h_logLuminance[i];
+			}
+	}
+	free(h_logLuminance);
+}
 
-
-__global__ void normalize_cdf(
-    unsigned int* d_input_cdf,
-    float*        d_output_cdf,
-    int           n
-    )
+// shared memory version of max kernel
+__global__ void shmem_max(	float * d_out,
+							const float * d_in,
+							int threads,
+							int padded_threads)
 {
-  const float normalization_constant = 1.f / d_input_cdf[n - 1];
+    // sdata is allocated in the kernel call: 3rd arg to <<<b, t, shmem>>>
+    extern __shared__ float sdata[];
 
-  int global_index_1d = ( blockIdx.x * blockDim.x ) + threadIdx.x;
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid  = threadIdx.x;
 
-  if ( global_index_1d < n )
-  {
-    unsigned int input_value  = d_input_cdf[ global_index_1d ];
-    float        output_value = input_value * normalization_constant;
+    // load shared mem from global mem
+	if (tid < threads){
+		sdata[tid] = d_in[myId];
+	}
+	// padding in data to fill power of 2 requirement
+	else {
+		sdata[tid] = d_in[0];
+	}
+    __syncthreads();            // make sure entire block is loaded!
 
-    d_output_cdf[ global_index_1d ] = output_value;
-  }
+    // do reduction in shared mem
+	// this generates exponential values of 2 (e.g. 16, 8, 4, 2 , 1)
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            sdata[tid] = max(sdata[tid],sdata[tid + s]);
+        }
+        __syncthreads();        // make sure all adds at one stage are done!
+    }
+
+    // only thread 0 writes result for this block back to global mem
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = sdata[0];
+    }
 }
 
-
-/* Copied from Mike's IPython notebook *
-   Modified double constants -> float  *
-   Perform tone mapping based upon new *
-   luminance scaling                   */
-
-__global__ void tonemap(
-    float* d_x,
-    float* d_y,
-    float* d_log_Y,
-    float* d_cdf_norm,
-    float* d_r_new,
-    float* d_g_new,
-    float* d_b_new,
-    float  min_log_Y,
-    float  max_log_Y,
-    float  log_Y_range,
-    int    num_bins,
-    int    num_pixels_y,
-    int    num_pixels_x )
+// shared memory version of min kernel
+__global__ void shmem_min(	float * d_out,
+							const float * d_in,
+							int threads,
+							int padded_threads)
 {
-  int  ny             = num_pixels_y;
-  int  nx             = num_pixels_x;
-  int2 image_index_2d = make_int2( ( blockIdx.x * blockDim.x ) + threadIdx.x, ( blockIdx.y * blockDim.y ) + threadIdx.y );
-  int  image_index_1d = ( nx * image_index_2d.y ) + image_index_2d.x;
+    // sdata is allocated in the kernel call: 3rd arg to <<<b, t, shmem>>>
+    extern __shared__ float sdata[];
 
-  if ( image_index_2d.x < nx && image_index_2d.y < ny )
-  {
-    float x         = d_x[ image_index_1d ];
-    float y         = d_y[ image_index_1d ];
-    float log_Y     = d_log_Y[ image_index_1d ];
-    int   bin_index = min( num_bins - 1, int( (num_bins * ( log_Y - min_log_Y ) ) / log_Y_range ) );
-    float Y_new     = d_cdf_norm[ bin_index ];
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid  = threadIdx.x;
 
-    float X_new = x * ( Y_new / y );
-    float Z_new = ( 1 - x - y ) * ( Y_new / y );
+    // load shared mem from global mem
+	if (tid < threads){
+		sdata[tid] = d_in[myId];
+	}
+	// padding in data to fill power of 2 requirement
+	else {
+		sdata[tid] = d_in[0];
+	}
+    __syncthreads();            // make sure entire block is loaded!
 
-    float r_new = ( X_new *  3.2406f ) + ( Y_new * -1.5372f ) + ( Z_new * -0.4986f );
-    float g_new = ( X_new * -0.9689f ) + ( Y_new *  1.8758f ) + ( Z_new *  0.0415f );
-    float b_new = ( X_new *  0.0557f ) + ( Y_new * -0.2040f ) + ( Z_new *  1.0570f );
+    // do reduction in shared mem
+	// this generates exponential values of 2 (e.g. 16, 8, 4, 2 , 1)
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            sdata[tid] = min(sdata[tid],sdata[tid + s]);
+        }
+        __syncthreads();        // make sure all adds at one stage are done!
+    }
 
-    d_r_new[ image_index_1d ] = r_new;
-    d_g_new[ image_index_1d ] = g_new;
-    d_b_new[ image_index_1d ] = b_new;
-  }
+    // only thread 0 writes result for this block back to global mem
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+// serial wrapper code for gpu maxmin
+void gpu_maxmin(const float* const  d_logLuminance,
+				const int array_size,
+				float* min_logLum,
+				float* max_logLum){
+	printf("Shared memory implentation\n");
+	const int array_bytes = array_size * sizeof(float);
+    float * d_intermediate, * d_out;
+
+	cudaMalloc((void **) &d_intermediate, array_bytes); // overallocated
+    cudaMalloc((void **) &d_out, sizeof(float));
+
+	 // assumes that size is not greater than maxThreadsPerBlock^2
+    // and that size is a multiple of maxThreadsPerBlock
+    const int maxThreadsPerBlock = 1024;
+    int threads = maxThreadsPerBlock;
+    int blocks = array_size / maxThreadsPerBlock;
+    shmem_max<<<blocks, threads, threads * sizeof(float)>>>
+            (d_intermediate, d_logLuminance, maxThreadsPerBlock , maxThreadsPerBlock);
+			
+    // now we're down to one block left, so reduce it
+	// the number of threads needs to be a power of 2
+	int padded_threads = pow(2,ceil(log2( (double) blocks)));
+    threads = padded_threads; // launch one thread for each block in prev step
+    blocks = 1;
+    shmem_max<<<blocks, threads, padded_threads * sizeof(float)>>>
+            (d_out, d_intermediate , threads, padded_threads);
+    
+	cudaMemcpy(max_logLum , d_out, sizeof(float), cudaMemcpyDeviceToHost);
+	
+	threads = maxThreadsPerBlock;
+    blocks = array_size / maxThreadsPerBlock;
+    shmem_min<<<blocks, threads, threads * sizeof(float)>>>
+            (d_intermediate, d_logLuminance, maxThreadsPerBlock , maxThreadsPerBlock);
+			
+    // now we're down to one block left, so reduce it
+	// the number of threads needs to be a power of 2
+    threads = padded_threads; // launch one thread for each block in prev step
+    blocks = 1;
+    shmem_min<<<blocks, threads, padded_threads * sizeof(float)>>>
+            (d_out, d_intermediate , threads, padded_threads);
+    
+	cudaMemcpy(min_logLum , d_out, sizeof(float), cudaMemcpyDeviceToHost);
+
+	// clean up
+	cudaFree(d_intermediate);
+	cudaFree(d_out);
+}
+
+void display_maxmin(float* min_logLum,
+                    float* max_logLum){
+	printf("Maximum: %f\n" , *max_logLum);
+	printf("Mininum: %f\n" , *min_logLum);
+}
+
+// atomic (naive) implemantion of historgram
+__global__ void atomic_histogram(unsigned int * d_bins ,
+									const float * d_logLuminance,
+									size_t numBins ,
+									float lumRange ,
+									float min_logLum){
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	float myItem = d_logLuminance[myId];
+	// the formula: bin = (lum[i] - lumMin) / lumRange * numBins
+	int myBin = round(((myItem - min_logLum) / lumRange) * (float) numBins);
+	atomicAdd(&(d_bins[myBin]) , 1 );
+}
+
+// (slow) atomic version of pdf to cdf
+__global__ void atomic_cdf(unsigned int * d_pdf , unsigned int* const d_cdf , int numBins){
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	int myItem = d_pdf[myId];
+	for (int i = myId ; i < numBins ; i++){
+		atomicAdd( &(d_cdf[i]) , myItem);
+	}
+}
+
+// sets array to 0
+__global__ void set2zero(unsigned int * d_pdf){
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	d_pdf[myId] = 0;
+}
+
+// Serial wrapper for atomic historgram implemantion
+void atomic_histogram(	const float* const d_logLuminance,
+							unsigned int* const d_cdf,
+							const size_t numBins,
+							const int array_size,
+							float lumRange,
+							float min_logLum){
+	
+	printf("Atomic histogram\n");
+	unsigned int * d_pdf;
+    cudaMalloc((void **) &d_pdf, sizeof(int) * numBins);
+	int threads = numBins;
+	int blocks = 1;
+	set2zero<<<blocks, threads>>>(d_pdf);
+
+	blocks = array_size / 1024;
+	threads = 1024; // max_threads
+	atomic_histogram<<<blocks, threads>>>(d_pdf , d_logLuminance, numBins , lumRange , min_logLum);
+	atomic_cdf<<<blocks, threads>>>(d_pdf , d_cdf , numBins);
+
+	cudaFree(d_pdf);
+
 }
 
 
-//return types are void since any internal error will be handled by quitting
-//no point in returning error codes...
-void preProcess(float** d_luminance, unsigned int** d_cdf,
-                size_t *numRows, size_t *numCols,
-                unsigned int *numberOfBins,
-                const std::string &filename) {
-  //make sure the context initializes ok
-  checkCudaErrors(cudaFree(0));
-
-  float *imgPtr; //we will become responsible for this pointer
-  loadImageHDR(filename, &imgPtr, &numRows__, &numCols__);
-  *numRows = numRows__;
-  *numCols = numCols__;
-
-  //first thing to do is split incoming BGR float data into separate channels
-  size_t numPixels = numRows__ * numCols__;
-  float *red   = new float[numPixels];
-  float *green = new float[numPixels];
-  float *blue  = new float[numPixels];
-
-  //Remeber image is loaded BGR
-  for (size_t i = 0; i < numPixels; ++i) {
-    blue[i]  = imgPtr[3 * i + 0];
-    green[i] = imgPtr[3 * i + 1];
-    red[i]   = imgPtr[3 * i + 2];
-  }
-
-  delete[] imgPtr; //being good citizens are releasing resources
-                   //allocated in loadImageHDR
-
-  float *d_red, *d_green, *d_blue;  //RGB space
-
-  size_t channelSize = sizeof(float) * numPixels;
-
-  checkCudaErrors(cudaMalloc(&d_red,    channelSize));
-  checkCudaErrors(cudaMalloc(&d_green,  channelSize));
-  checkCudaErrors(cudaMalloc(&d_blue,   channelSize));
-  checkCudaErrors(cudaMalloc(&d_x__,    channelSize));
-  checkCudaErrors(cudaMalloc(&d_y__,    channelSize));
-  checkCudaErrors(cudaMalloc(&d_logY__, channelSize));
-
-  checkCudaErrors(cudaMemcpy(d_red,   red,   channelSize, cudaMemcpyHostToDevice));
-  checkCudaErrors(cudaMemcpy(d_green, green, channelSize, cudaMemcpyHostToDevice));
-  checkCudaErrors(cudaMemcpy(d_blue,  blue,  channelSize, cudaMemcpyHostToDevice));
-
-  //convert from RGB space to chrominance/luminance space xyY
-  const dim3 blockSize(32, 16, 1);
-  const dim3 gridSize( (numCols__ + blockSize.x - 1) / blockSize.x, 
-                       (numRows__ + blockSize.y - 1) / blockSize.y, 1);
-  rgb_to_xyY<<<gridSize, blockSize>>>(d_red, d_green, d_blue,
-                                      d_x__, d_y__,   d_logY__,
-                                      .0001f, numRows__, numCols__);
-
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  *d_luminance = d_logY__;
-
-  //allocate memory for the cdf of the histogram
-  *numberOfBins = numBins;
-  checkCudaErrors(cudaMalloc(&d_cdf__, sizeof(unsigned int) * numBins));
-  checkCudaErrors(cudaMemset(d_cdf__, 0, sizeof(unsigned int) * numBins));
-
-  *d_cdf = d_cdf__;
-
-  checkCudaErrors(cudaFree(d_red));
-  checkCudaErrors(cudaFree(d_green));
-  checkCudaErrors(cudaFree(d_blue));
-
-  delete[] red;
-  delete[] green;
-  delete[] blue;
+__global__ void lum2bin(	unsigned int * d_pdf, 
+							const float* const  d_logLuminance,
+							float C,
+							float A){
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	d_pdf[myId] = round(A * d_logLuminance[myId] + C);
 }
 
-void postProcess(const std::string& output_file, 
-                 size_t numRows, size_t numCols,
-                 float min_log_Y, float max_log_Y) {
-  const int numPixels = numRows__ * numCols__;
-
-  const int numThreads = 192;
-
-  float *d_cdf_normalized;
-
-  checkCudaErrors(cudaMalloc(&d_cdf_normalized, sizeof(float) * numBins));
-
-  //first normalize the cdf to a maximum value of 1
-  //this is how we compress the range of the luminance channel
-  normalize_cdf<<< (numBins + numThreads - 1) / numThreads,
-                    numThreads>>>(d_cdf__,
-                                  d_cdf_normalized,
-                                  numBins);
-
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  //allocate memory for the output RGB channels
-  float *h_red, *h_green, *h_blue;
-  float *d_red, *d_green, *d_blue;
-
-  h_red   = new float[numPixels];
-  h_green = new float[numPixels];
-  h_blue  = new float[numPixels];
-
-  checkCudaErrors(cudaMalloc(&d_red,   sizeof(float) * numPixels));
-  checkCudaErrors(cudaMalloc(&d_green, sizeof(float) * numPixels));
-  checkCudaErrors(cudaMalloc(&d_blue,  sizeof(float) * numPixels));
-
-  float log_Y_range = max_log_Y - min_log_Y;
-
-  const dim3 blockSize(32, 16, 1);
-  const dim3 gridSize( (numCols + blockSize.x - 1) / blockSize.x,
-                       (numRows + blockSize.y - 1) / blockSize.y );
-  //next perform the actual tone-mapping
-  //we map each luminance value to its new value
-  //and then transform back to RGB space
-  tonemap<<<gridSize, blockSize>>>(d_x__, d_y__, d_logY__,
-                                   d_cdf_normalized,
-                                   d_red, d_green, d_blue,
-                                   min_log_Y, max_log_Y,
-                                   log_Y_range, numBins,
-                                   numRows, numCols);
-
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  checkCudaErrors(cudaMemcpy(h_red,   d_red,   sizeof(float) * numPixels, cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(h_green, d_green, sizeof(float) * numPixels, cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(h_blue,  d_blue,  sizeof(float) * numPixels, cudaMemcpyDeviceToHost));
-
-  //recombine the image channels
-  float *imageHDR = new float[numPixels * 3];
-
-  for (int i = 0; i < numPixels; ++i) {
-    imageHDR[3 * i + 0] = h_blue[i];
-    imageHDR[3 * i + 1] = h_green[i];
-    imageHDR[3 * i + 2] = h_red[i];
-  }
-
-  saveImageHDR(imageHDR, numRows, numCols, output_file);
-
-  delete[] imageHDR;
-  delete[] h_red;
-  delete[] h_green;
-  delete[] h_blue;
-
-  //cleanup
-  checkCudaErrors(cudaFree(d_cdf_normalized));
+__global__ void vector2array(	unsigned int* const d_cdf_pointer,
+								unsigned int* const d_cdf){
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	d_cdf[myId] = d_cdf_pointer[myId];
 }
 
-void cleanupGlobalMemory(void)
+void thrust_histogram(	const float* const d_logLuminance,
+						unsigned int* const d_cdf,
+						const size_t numBins,
+						const int array_size,
+						float lumRange,
+						float min_logLum){
+	printf("Thrust histogram\n");
+	
+	// Constants for SAXPY (Single-Precision A·X Plus Y)
+	float C = - min_logLum / lumRange * (float) numBins;
+	float A = (float) numBins / lumRange;
+	unsigned int * d_pdf;
+    cudaMalloc((void **) &d_pdf, sizeof(unsigned int) * numBins);
+	const int maxThreadsPerBlock = 1024;
+	int threads = maxThreadsPerBlock;
+    int blocks = array_size / maxThreadsPerBlock;
+	// mapping to bin
+	//thrust::device_vector<unsigned int> key_vec(array_size);                    
+	lum2bin<<<blocks, threads>>>(d_pdf , d_logLuminance, C , A);
+	
+	// Use thrust library to sort by bin
+	// copy data into thrust vector
+    thrust::device_ptr<unsigned int> d_ptr(d_pdf);
+	thrust::device_vector<unsigned int> key_vec(d_ptr , d_ptr +  array_size);
+ 
+    //thrust::exclusive_scan(dev_ptr, dev_ptr+array_size, key_vec.begin());
+	
+	// sort vector
+	//thrust::sort(key_vec.begin(), key_vec.end());
+	// key_vec is size of array that looks like 000111122244455555
+	
+/* 	// fill vector with 1's and 0's
+	thrust::device_vector<unsigned int> values_vec(array_size * 2);
+    thrust::fill(values_vec.begin(), values_vec.begin() + array_size, 1);
+	thrust::fill(values_vec.begin() + array_size, values_vec.end(), 0);
+
+	// create a vector of 0's that is the length of empty bins
+	// I need a list of elements that are not in bin
+	// 0..numBins
+	
+	thrust::device_vector<unsigned int> empty_key_vec(array_size);
+	thrust::sequence(empty_key_vec.begin(), empty_key_vec.end());
+
+	key_vec.insert(key_vec.end(),empty_key_vec.begin(), empty_key_vec.end());
+
+	// join keys
+	// sort again
+	
+	// reduce by keys
+	thrust::reduce_by_key(key_vec.begin(), key_vec.end(), values_vec.begin(), key_vec.begin(), values_vec.begin());
+	
+
+
+	
+	
+	// Convert pdf to cdf
+	thrust::device_vector<unsigned int> d_cdf_vector(values_vec.size()); 
+	
+	thrust::exclusive_scan(values_vec.begin(), values_vec.end(), d_cdf_vector.begin());  */
+	unsigned int* d_cdf_pointer;
+	d_cdf_pointer = (unsigned int*) thrust::raw_pointer_cast(&key_vec[0]);
+	//d_cdf_pointer = (unsigned int*) thrust::raw_pointer_cast(&d_cdf_vector[0]);
+	// copy data into d_cdf	
+	vector2array<<<blocks, threads>>>(d_cdf_pointer , d_cdf);
+	cudaFree(d_pdf);
+	
+}
+void printCDF(unsigned int* const d_cdf , const size_t numBins){
+  thrust::device_ptr<unsigned int> dev_ptr_key        = thrust::device_pointer_cast(d_cdf);
+
+	//unsigned int* const h_cdf = (unsigned int* const) malloc(numBins * sizeof(unsigned int));
+	//cudaMemcpy(h_cdf, d_cdf, numBins * sizeof(unsigned int* const) , cudaMemcpyDeviceToHost);
+	for (int i = 0; i < numBins ; i++){
+		printf("%i: %i\n",i,(unsigned int)*(dev_ptr_key+i));
+		//printf("%i: %i\n" , i , h_cdf[i]);
+	};
+	//free(h_cdf);
+}
+
+// maps 1024 elements to the indvidual bin
+__global__ void gpu_histogram_ker(unsigned int * d_pdf, unsigned int * d_local_histo , unsigned int numThread){
+	int id = threadIdx.x;
+	int his_id = blockDim.x * id;
+	int pdf_id = id * numThread;
+	for (int i = 0; i < numThread ; i++){
+		int bin = d_pdf[pdf_id + i];
+		// increase local histogram in bin by 1
+		d_local_histo[his_id + bin]++; 
+	}
+}
+
+// This code is inneffiecent for two reasons. The for loop is not utilizing the full extent of the gpu
+// The code is reading from non-sequential areas.
+__global__ void sum_local_histo(unsigned int * d_local_histo , unsigned int* const d_cdf, unsigned int numThread){
+	int id = threadIdx.x;
+	for (int i = 0; i < numThread ; i++){
+		d_cdf[id] = d_cdf[id] + d_local_histo[id + i * numThread];
+	}
+	
+}
+
+__global__ void hillissteel_scan(unsigned int* const d_cdf){
+		int id = threadIdx.x;
+		// this generates exponential values of 2 (e.g. 16, 8, 4, 2 , 1)
+		// I want 1, 2,4,8
+		for (unsigned int i = 1; i < blockDim.x ; i <<= 1){
+			int neighbor = id - i;
+			if (neighbor > 0) d_cdf[id] = d_cdf[neighbor] + d_cdf[id];
+			__syncthreads();            // make sure entire block is loaded!
+		}
+}
+
+
+void gpu_histogram(	const float* const d_logLuminance,
+							unsigned int* const d_cdf,
+							const size_t numBins,
+							const int array_size,
+							float lumRange,
+							float min_logLum){
+	
+	printf("Gpu histogram\n");
+	const int maxThreadsPerBlock = 1024;
+
+	
+	unsigned int * d_local_histo;
+	cudaMalloc((void **) &d_local_histo, sizeof(unsigned int) * numBins * maxThreadsPerBlock);
+	int threads = 1024; // max_threads
+	int blocks = numBins;
+	set2zero<<<blocks, threads>>>(d_local_histo);
+	
+    blocks = 1;
+	threads = numBins;
+	set2zero<<<blocks, threads>>>(d_cdf);
+	
+	
+	// Constants for SAXPY (Single-Precision A·X Plus Y)
+	float C = - min_logLum / lumRange * (float) numBins;
+	float A = (float) numBins / lumRange;
+	unsigned int * d_pdf;
+    cudaMalloc((void **) &d_pdf, sizeof(unsigned int) * array_size);
+	threads = maxThreadsPerBlock;
+    blocks = array_size/ threads;
+	lum2bin<<<blocks, threads>>>(d_pdf , d_logLuminance, C , A);
+	// d_pdf is an unsorted listing of a 1to1 transformation from luminance to bin
+
+
+	// launch a kernel that computes a local histogram of 1024 elements
+
+	unsigned int numThread = array_size / threads;
+	assert(array_size % threads == 0);
+	blocks = 1;
+	threads = 1024; // max_threads
+	gpu_histogram_ker<<<blocks, threads>>>(d_pdf, d_local_histo,numThread);
+
+	threads = maxThreadsPerBlock;
+    blocks = numBins/ threads;
+	set2zero<<<blocks, threads>>>(d_pdf);
+
+	// now I need to sum all the local histograms 
+	numThread = 1024;
+	blocks = blocks;
+	threads = threads;
+	sum_local_histo<<<blocks, threads>>>(d_local_histo , d_cdf , numThread);
+			
+	blocks = 1;
+	threads = numBins; // max_threads
+	hillissteel_scan<<<blocks, threads>>>(d_cdf);
+	
+	cudaFree(d_local_histo);
+	cudaFree(d_pdf); 
+
+}
+
+void your_histogram_and_prefixsum(const float* const d_logLuminance,
+                                  unsigned int* const d_cdf,
+                                  float &min_logLum,
+                                  float &max_logLum,
+                                  const size_t numRows,
+                                  const size_t numCols,
+                                  const size_t numBins)
 {
-  checkCudaErrors(cudaFree(d_x__));
-  checkCudaErrors(cudaFree(d_y__));
-  checkCudaErrors(cudaFree(d_logY__));
-  checkCudaErrors(cudaFree(d_cdf__));
+  //TODO
+  /*Here are the steps you need to implement
+    1) find the minimum and maximum value in the input logLuminance channel
+       store in min_logLum and max_logLum
+    2) subtract them to find the range
+    3) generate a histogram of all the values in the logLuminance channel using
+       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
+    4) Perform an exclusive scan (prefix sum) on the histogram to get
+       the cumul vfgmative distribution of luminance values (this should go in the
+       incoming d_cdf pointer which already has been allocated for you)       */
+	// declare GPU memory pointers
+    GpuTimer timer;
+	const int array_size = numCols * numRows;
+	
+	// Three different implemantions of max,min function
+	time(thrust_maxmin(d_logLuminance , array_size , &min_logLum , &max_logLum), true)
+	time(serial_maxmin(d_logLuminance , array_size , &min_logLum , &max_logLum), true)
+	time(   gpu_maxmin(d_logLuminance , array_size , &min_logLum , &max_logLum), true)
+
+	float lumRange = max_logLum - min_logLum;
+	
+	// Two different implemantions of histogram
+	time(atomic_histogram(d_logLuminance , d_cdf , numBins  ,array_size , lumRange , min_logLum) , false);
+	//time(thrust_histogram(d_logLuminance , d_cdf,numBins,array_size,lumRange, min_logLum),false);
+	time(gpu_histogram(d_logLuminance , d_cdf , numBins  ,array_size , lumRange , min_logLum) , false);
+
+	
 }
